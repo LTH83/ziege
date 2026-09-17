@@ -25,6 +25,41 @@ static uint32_t le32(const uint8_t *p) {
 }
 
 void SoundCache::setup() {
+  init_state_.store(InitState::INITIALIZING);
+  ESP_LOGI(TAG, "Async cache init v1: starting background storage setup");
+  // Mounting/formatting a large partition must not hold up ESPHome's loopTask.
+  // Idle priority also lets CPU 0's idle task run during long flash operations.
+  if (xTaskCreatePinnedToCore(init_task_entry_, "cache_init", 8192, this, tskIDLE_PRIORITY, nullptr, 0) != pdPASS) {
+    init_state_.store(InitState::FAILED);
+    ESP_LOGE(TAG, "Cannot create cache init task; local functions remain available");
+    mark_failed();
+  }
+}
+
+void SoundCache::init_task_entry_(void *param) {
+  auto *self = static_cast<SoundCache *>(param);
+  const bool ready = self->initialize_cache_();
+  // Publish readiness only after all filesystem/index writes have completed.
+  self->init_state_.store(ready ? InitState::READY : InitState::FAILED);
+  vTaskDelete(nullptr);
+}
+
+void SoundCache::loop() {
+  if (init_reported_) return;
+  const auto state = init_state_.load();
+  if (state == InitState::READY) {
+    init_reported_ = true;
+    ESP_LOGI(TAG, "Async cache init complete; cached sounds enabled");
+  } else if (state == InitState::FAILED) {
+    init_reported_ = true;
+    ESP_LOGE(TAG, "Cache init failed; local functions remain available");
+    // Component state changes belong to ESPHome's main task, not our worker.
+    mark_failed();
+  }
+}
+
+bool SoundCache::initialize_cache_() {
+  ESP_LOGI(TAG, "Mounting sound cache (formatting if needed) in background");
   esp_vfs_spiffs_conf_t conf{};
   conf.base_path = mount_path_.c_str();
   conf.partition_label = partition_label_.c_str();
@@ -33,11 +68,11 @@ void SoundCache::setup() {
   esp_err_t err = esp_vfs_spiffs_register(&conf);
   if (err != ESP_OK) {
     ESP_LOGE(TAG, "SPIFFS mount failed: %s", esp_err_to_name(err));
-    mark_failed();
-    return;
+    return false;
   }
   load_index_();
   ESP_LOGI(TAG, "SPIFFS ready, free=%llu bytes", static_cast<unsigned long long>(free_bytes_()));
+  return true;
 }
 
 void SoundCache::dump_config() {
@@ -61,6 +96,10 @@ bool SoundCache::sanitize_name_(const std::string &input, std::string &name) con
 }
 
 void SoundCache::play(const std::string &input, float volume) {
+  if (init_state_.load() != InitState::READY) {
+    ESP_LOGW(TAG, "Sound request ignored: cache is not ready");
+    return;
+  }
   std::string name;
   if (!sanitize_name_(input, name)) {
     ESP_LOGE(TAG, "Rejected sound name: %s", input.c_str());
@@ -339,6 +378,10 @@ void SoundCache::save_index_() {
 }
 
 void SoundCache::clear() {
+  if (init_state_.load() != InitState::READY) {
+    ESP_LOGW(TAG, "Clear request ignored: cache is not ready");
+    return;
+  }
   if (busy_) return;
   DIR *dir = opendir(mount_path_.c_str());
   if (dir) {
@@ -354,6 +397,8 @@ void SoundCache::clear() {
 }
 
 void SoundCache::stop() {
+  // A local Touch/PIR sound may call stop() while storage is still starting.
+  if (init_state_.load() != InitState::READY) return;
   cancel_ = true;
   portENTER_CRITICAL(&request_lock_);
   pending_name_.clear();

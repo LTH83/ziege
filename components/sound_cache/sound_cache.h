@@ -16,6 +16,7 @@ namespace esphome::sound_cache {
 class SoundCache : public Component {
  public:
   void setup() override;
+  void loop() override;
   void dump_config() override;
   float get_setup_priority() const override { return setup_priority::AFTER_WIFI; }
 
@@ -30,6 +31,9 @@ class SoundCache : public Component {
   void clear();
 
  protected:
+  enum class InitState : uint8_t { NOT_STARTED, INITIALIZING, READY, FAILED };
+  static void init_task_entry_(void *param);
+  bool initialize_cache_();
   static void task_entry_(void *param);
   void task_();
   bool sanitize_name_(const std::string &input, std::string &name) const;
@@ -55,6 +59,8 @@ class SoundCache : public Component {
   float pending_volume_{0.60f};
   std::atomic<bool> busy_{false};
   std::atomic<bool> cancel_{false};
+  std::atomic<InitState> init_state_{InitState::NOT_STARTED};
+  bool init_reported_{false};
   portMUX_TYPE request_lock_ = portMUX_INITIALIZER_UNLOCKED;
 };
 
